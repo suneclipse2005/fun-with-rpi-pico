@@ -13,61 +13,45 @@ FuRegisterClass("ColorMatchAI", CT_Tool, {
     REG_NoMotionBlurCtrls = true,
 })
 
-ColorMatchAIParams = [[
-    float strength;
-    float preserve_skin;
-    int show_scopes;
-    int has_lut;
-    int lut_size;
-]]
-
 OpenCLCode = [[
-// Helper to sample 3D LUT flattened into a 2D image (size: lut_size*lut_size width, lut_size height)
-float4 sample_3d_lut_2d(__read_only image2d_t lut_img, int lut_size, float3 color) {
-    // clamp color to [0, 1]
+// Helper to sample 3D LUT flattened into a 2D image
+inline float4 sample_3d_lut_2d(__read_only image2d_t lut_img, int lut_size, float3 color) {
     color = clamp(color, 0.0f, 1.0f);
 
-    // Scale to LUT index space [0, lut_size - 1]
-    float r = color.x * (lut_size - 1);
-    float g = color.y * (lut_size - 1);
-    float b = color.z * (lut_size - 1);
+    float r = color.x * (float)(lut_size - 1);
+    float g = color.y * (float)(lut_size - 1);
+    float b = color.z * (float)(lut_size - 1);
 
-    // Trilinear interpolation weights and indices
-    int r0 = (int)floor(r); int r1 = min(r0 + 1, lut_size - 1); float fr = r - r0;
-    int g0 = (int)floor(g); int g1 = min(g0 + 1, lut_size - 1); float fg = g - g0;
-    int b0 = (int)floor(b); int b1 = min(b0 + 1, lut_size - 1); float fb = b - b0;
+    int r0 = (int)floor(r); int r1 = min(r0 + 1, lut_size - 1); float fr = r - (float)r0;
+    int g0 = (int)floor(g); int g1 = min(g0 + 1, lut_size - 1); float fg = g - (float)g0;
+    int b0 = (int)floor(b); int b1 = min(b0 + 1, lut_size - 1); float fb = b - (float)b0;
 
-    // Helper to read a single pixel from the flattened 2D LUT
-    // Format: The 2D image has height = lut_size, width = lut_size * lut_size
-    // B goes along the Y axis, G goes along X within a block, R selects the block
-    // Wait, the structure created in Lua is:
-    // width = lut_size (r_idx), height = lut_size (g_idx)
-    // we tile it horizontally for each b_idx, so width = lut_size * lut_size, height = lut_size.
-    // X = b_idx * lut_size + r_idx
-    // Y = g_idx
+    int2 p000 = (int2)(b0 * lut_size + r0, g0);
+    int2 p100 = (int2)(b0 * lut_size + r1, g0);
+    int2 p010 = (int2)(b0 * lut_size + r0, g1);
+    int2 p110 = (int2)(b0 * lut_size + r1, g1);
+    int2 p001 = (int2)(b1 * lut_size + r0, g0);
+    int2 p101 = (int2)(b1 * lut_size + r1, g0);
+    int2 p011 = (int2)(b1 * lut_size + r0, g1);
+    int2 p111 = (int2)(b1 * lut_size + r1, g1);
 
-    #define READ_LUT(rr, gg, bb) read_imagef(lut_img, (int2)((bb) * lut_size + (rr), (gg)))
+    float4 c000 = read_imagef(lut_img, p000);
+    float4 c100 = read_imagef(lut_img, p100);
+    float4 c010 = read_imagef(lut_img, p010);
+    float4 c110 = read_imagef(lut_img, p110);
+    float4 c001 = read_imagef(lut_img, p001);
+    float4 c101 = read_imagef(lut_img, p101);
+    float4 c011 = read_imagef(lut_img, p011);
+    float4 c111 = read_imagef(lut_img, p111);
 
-    float4 c000 = READ_LUT(r0, g0, b0);
-    float4 c100 = READ_LUT(r1, g0, b0);
-    float4 c010 = READ_LUT(r0, g1, b0);
-    float4 c110 = READ_LUT(r1, g1, b0);
-    float4 c001 = READ_LUT(r0, g0, b1);
-    float4 c101 = READ_LUT(r1, g0, b1);
-    float4 c011 = READ_LUT(r0, g1, b1);
-    float4 c111 = READ_LUT(r1, g1, b1);
-
-    // Interpolate along R
     float4 c00 = mix(c000, c100, fr);
     float4 c10 = mix(c010, c110, fr);
     float4 c01 = mix(c001, c101, fr);
     float4 c11 = mix(c011, c111, fr);
 
-    // Interpolate along G
     float4 c0 = mix(c00, c10, fg);
     float4 c1 = mix(c01, c11, fg);
 
-    // Interpolate along B
     return mix(c0, c1, fb);
 }
 
@@ -75,7 +59,7 @@ __kernel void ColorMatchAIKernel(
     __read_only image2d_t target_img,
     __write_only image2d_t out_img,
     __read_only image2d_t lut_img,
-    constant struct GlobalParams *params)
+    __read_only image2d_t params_img)
 {
     int2 pos = (int2)(get_global_id(0), get_global_id(1));
     int width = get_image_width(target_img);
@@ -84,17 +68,27 @@ __kernel void ColorMatchAIKernel(
     if (pos.x >= width || pos.y >= height)
         return;
 
+    // Read parameters from the 2x1 image buffer
+    float4 p0 = read_imagef(params_img, (int2)(0, 0));
+    float4 p1 = read_imagef(params_img, (int2)(1, 0));
+
+    float strength = p0.x;
+    float preserve_skin = p0.y;
+    int show_scopes = (int)p0.z;
+    int has_lut = (int)p0.w;
+    int lut_size = (int)p1.x;
+
     float4 in_color = read_imagef(target_img, pos);
     float4 out_color = in_color;
 
-    if (params->has_lut > 0 && params->strength > 0.0f) {
-        float4 mapped_color = sample_3d_lut_2d(lut_img, params->lut_size, in_color.xyz);
+    if (has_lut > 0 && strength > 0.0f) {
+        float4 mapped_color = sample_3d_lut_2d(lut_img, lut_size, in_color.xyz);
         mapped_color.w = in_color.w;
-        out_color = mix(in_color, mapped_color, params->strength);
+        out_color = mix(in_color, mapped_color, strength);
     }
 
     // Simple skin tone preservation mask (Hue targeting)
-    if (params->preserve_skin > 0.0f) {
+    if (preserve_skin > 0.0f) {
         float r = in_color.x;
         float g = in_color.y;
         float b = in_color.z;
@@ -104,16 +98,42 @@ __kernel void ColorMatchAIKernel(
 
         bool is_skin = (r > 0.35f && g > 0.15f && b > 0.1f && r > g && r > b && (max_val - min_val) > 0.05f);
         if (is_skin) {
-            out_color = mix(out_color, in_color, params->preserve_skin);
+            out_color = mix(out_color, in_color, preserve_skin);
         }
     }
 
-    // Draw Scopes Overlay
-    if (params->show_scopes > 0) {
+    // Draw Scopes Overlay (Crude Luma Waveform Approximation)
+    if (show_scopes > 0) {
         if (pos.x < 256 && pos.y < 256) {
-            out_color = mix(out_color, (float4)(0.1f, 0.1f, 0.1f, 1.0f), 0.8f);
-            if (pos.x == 128 || pos.y == 128) out_color = (float4)(0.5f, 0.5f, 0.5f, 1.0f);
-            if (pos.x < 2 || pos.x > 254 || pos.y < 2 || pos.y > 254) out_color = (float4)(0.8f, 0.8f, 0.8f, 1.0f);
+            out_color = mix(out_color, (float4)(0.1f, 0.1f, 0.1f, 1.0f), 0.8f); // BG
+            if (pos.x == 128 || pos.y == 128) out_color = (float4)(0.5f, 0.5f, 0.5f, 1.0f); // Axes
+            if (pos.x < 2 || pos.x > 254 || pos.y < 2 || pos.y > 254) out_color = (float4)(0.8f, 0.8f, 0.8f, 1.0f); // Border
+
+            // Render basic waveform by column sampling
+            // We sample roughly 64 points in the mapped image column to find density
+            int img_col = (int)((float)pos.x / 256.0f * (float)width);
+            float target_luma = (float)pos.y / 256.0f;
+            int matches = 0;
+
+            int step = max(1, height / 64);
+            for (int y = 0; y < height; y += step) {
+                float4 p = read_imagef(target_img, (int2)(img_col, y));
+
+                // If lut applied, we need the mapped color for accuracy. For speed, we estimate.
+                if (has_lut > 0 && strength > 0.0f) {
+                    p = sample_3d_lut_2d(lut_img, lut_size, p.xyz);
+                }
+
+                float luma = 0.2126f * p.x + 0.7152f * p.y + 0.0722f * p.z;
+                if (fabs(luma - target_luma) < 0.02f) {
+                    matches++;
+                }
+            }
+
+            if (matches > 0) {
+                float intensity = min(1.0f, (float)matches * 0.15f);
+                out_color = mix(out_color, (float4)(0.2f, 0.8f, 0.2f, 1.0f), intensity);
+            }
         }
     }
 
@@ -122,26 +142,40 @@ __kernel void ColorMatchAIKernel(
 ]]
 
 function Create()
-    InTarget = self:AddInput("Target Image", "TargetImage", { LINKID_DataType = "Image", LINK_Main = 1 })
-    InReference = self:AddInput("Reference Image", "ReferenceImage", { LINKID_DataType = "Image", LINK_Main = 2 })
+    self.InTarget = self:AddInput("Target Image", "TargetImage", { LINKID_DataType = "Image", LINK_Main = 1 })
+    self.InReference = self:AddInput("Reference Image", "ReferenceImage", { LINKID_DataType = "Image", LINK_Main = 2 })
 
-    InMode = self:AddInput("Match Mode", "MatchMode", {
+    self.InMode = self:AddInput("Match Mode", "MatchMode", {
         LINKID_DataType = "Number", INPID_InputControl = "ComboControl", INP_Default = 0.0, INP_Integer = true,
         CC_String_0 = "Fast Match", CC_String_1 = "AI Precision",
     })
-    InStrength = self:AddInput("Match Strength", "MatchStrength", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 1.0, INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0 })
-    InPreserveSkin = self:AddInput("Preserve Skin", "PreserveSkin", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 0.0, INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0 })
-    InShowScopes = self:AddInput("Show Scopes Overlay", "ShowScopes", { LINKID_DataType = "Number", INPID_InputControl = "CheckboxControl", INP_Default = 0.0, INP_Integer = true })
+    self.InStrength = self:AddInput("Match Strength", "MatchStrength", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 1.0, INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0 })
+    self.InPreserveSkin = self:AddInput("Preserve Skin", "PreserveSkin", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 0.0, INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0 })
+    self.InShowScopes = self:AddInput("Show Scopes Overlay", "ShowScopes", { LINKID_DataType = "Number", INPID_InputControl = "CheckboxControl", INP_Default = 0.0, INP_Integer = true })
 
-    InAnalyze = self:AddInput("Analyze Frame", "Analyze", { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl", INP_Integer = false, BTNCS_Execute = "btn_analyze_clicked" })
-    InExport = self:AddInput("Export LUT (.cube)", "Export", { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl", INP_Integer = false, BTNCS_Execute = "btn_export_clicked" })
+    self.InAnalyze = self:AddInput("Analyze Frame", "Analyze", { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl", INP_Integer = false, BTNCS_Execute = "btn_analyze_clicked" })
+    self.InExport = self:AddInput("Export LUT (.cube)", "Export", { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl", INP_Integer = false, BTNCS_Execute = "btn_export_clicked" })
 
-    OutImage = self:AddOutput("Output", "Output", { LINKID_DataType = "Image", LINK_Main = 1 })
+    -- Invisible dummy control to force cache invalidation upon button click
+    self.InDummyTrigger = self:AddInput("DummyTrigger", "DummyTrigger", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 0.0, ICS_ControlPage = "Hidden" })
 
-    DoAnalyzeNextFrame = false
-    DoExportNextFrame = false
-    LoadedLUTImage = nil
-    LoadedLUTSize = 0
+    self.OutImage = self:AddOutput("Output", "Output", { LINKID_DataType = "Image", LINK_Main = 1 })
+
+    self.DoAnalyzeNextFrame = false
+    self.DoExportNextFrame = false
+    self.LoadedLUTImage = nil
+    self.LoadedLUTSize = 0
+    self.LastLUTModifiedTime = 0
+
+    -- Generate unique ID for this node instance to prevent file collisions
+    self.UniqueID = string.format("%04x", math.random(10000, 99999))
+    local temp_dir = os.getenv("TEMP")
+    if not temp_dir then temp_dir = "/tmp" end
+
+    self.TgtPath = temp_dir .. "/ColorMatchAI_tgt_" .. self.UniqueID .. ".ppm"
+    self.RefPath = temp_dir .. "/ColorMatchAI_ref_" .. self.UniqueID .. ".ppm"
+    self.LUTPath = temp_dir .. "/ColorMatchAI_out_" .. self.UniqueID .. ".cube"
+    self.JSONPath = temp_dir .. "/ColorMatchAI_out_" .. self.UniqueID .. ".json"
 end
 
 function FileExists(name)
@@ -150,12 +184,32 @@ function FileExists(name)
 end
 
 function NotifyChanged(inp, param, time)
-    if inp == InAnalyze then
+    if inp == self.InAnalyze then
         print("Analyze requested. Next frame processed will update the color match.")
-        DoAnalyzeNextFrame = true
-    elseif inp == InExport then
-        print("Export requested.")
-        DoExportNextFrame = true
+        self.DoAnalyzeNextFrame = true
+        self.InDummyTrigger:SetSource(Number(self.InDummyTrigger:GetValue(time).Value + 1), time)
+    elseif inp == self.InExport then
+        -- Execute file dialog synchronously on the UI thread, NOT in Process()
+        if not FileExists(self.LUTPath) then
+            print("Error: No LUT has been generated yet. Please click Analyze first.")
+            return
+        end
+
+        local out_path = fu:RequestFile("ColorMatchAI_Export.cube", self.LUTPath, {
+            FReqS_Filter = "Cube LUTs (*.cube)|*.cube",
+            FReqS_Title = "Save Generated LUT",
+            FReqB_Save = true
+        })
+
+        if out_path then
+            local is_windows = (package.config:sub(1,1) == "\\")
+            if is_windows then
+                os.execute('copy "' .. self.LUTPath:gsub("/", "\\") .. '" "' .. out_path:gsub("/", "\\") .. '"')
+            else
+                os.execute('cp "' .. self.LUTPath .. '" "' .. out_path .. '"')
+            end
+            print("LUT exported successfully to: " .. out_path)
+        end
     end
 end
 
@@ -247,49 +301,25 @@ function ParseCubeTo2D(filename)
 end
 
 function Process(req)
-    local target = InTarget:GetValue(req)
-    local ref = InReference:GetValue(req)
-    local strength = InStrength:GetValue(req).Value
-    local skin = InPreserveSkin:GetValue(req).Value
-    local show_scopes = InShowScopes:GetValue(req).Value
-    local match_mode = InMode:GetValue(req).Value
+    local target = self.InTarget:GetValue(req)
+    local ref = self.InReference:GetValue(req)
+    local strength = self.InStrength:GetValue(req).Value
+    local skin = self.InPreserveSkin:GetValue(req).Value
+    local show_scopes = self.InShowScopes:GetValue(req).Value
+    local match_mode = self.InMode:GetValue(req).Value
 
     if target == nil then return end
 
     local out = Image({IMG_Like = target})
 
     local is_windows = (package.config:sub(1,1) == "\\")
-    local temp_dir = os.getenv("TEMP")
-    if not temp_dir then temp_dir = "/tmp" end
 
-    local tgt_path = temp_dir .. "/ColorMatchAI_tgt.ppm"
-    local ref_path = temp_dir .. "/ColorMatchAI_ref.ppm"
-    local lut_path = temp_dir .. "/ColorMatchAI_out.cube"
-    local json_path = temp_dir .. "/ColorMatchAI_out.json"
-
-    if DoExportNextFrame then
-        DoExportNextFrame = false
-        if not FileExists(lut_path) then
-            print("Error: No LUT has been generated yet. Please click Analyze first.")
-        else
-            local out_path = ""
-            if is_windows then
-                out_path = os.getenv("USERPROFILE") .. "\\Downloads\\ColorMatchAI_Export.cube"
-                os.execute('copy "' .. lut_path:gsub("/", "\\") .. '" "' .. out_path .. '"')
-            else
-                out_path = os.getenv("HOME") .. "/Downloads/ColorMatchAI_Export.cube"
-                os.execute('cp "' .. lut_path .. '" "' .. out_path .. '"')
-            end
-            print("LUT exported successfully to: " .. out_path)
-        end
-    end
-
-    if DoAnalyzeNextFrame and ref ~= nil then
-        DoAnalyzeNextFrame = false
+    if self.DoAnalyzeNextFrame and ref ~= nil then
+        self.DoAnalyzeNextFrame = false
         print("Saving downsampled frames to disk for Python engine...")
 
-        SaveImageToPPM(target, tgt_path)
-        SaveImageToPPM(ref, ref_path)
+        SaveImageToPPM(target, self.TgtPath)
+        SaveImageToPPM(ref, self.RefPath)
 
         local mode_str = "Fast"
         if match_mode == 1.0 then mode_str = "AI_Precision" end
@@ -309,17 +339,20 @@ function Process(req)
         end
 
         print("Invoking Python Engine: " .. engine_path)
-        -- We must use standard Python command. If CV2 fails on PPM we might need to adjust, but OpenCV reads PPM.
         local cmd = string.format('python "%s" --ref "%s" --tgt "%s" --out_lut "%s" --out_json "%s" --mode "%s"',
-            engine_path, ref_path, tgt_path, lut_path, json_path, mode_str)
+            engine_path, self.RefPath, self.TgtPath, self.LUTPath, self.JSONPath, mode_str)
 
         local result = os.execute(cmd)
         if result == 0 or result == true then
              print("Analysis successful. Loading LUT into 2D memory map...")
-             local img, size = ParseCubeTo2D(lut_path)
+             local img, size = ParseCubeTo2D(self.LUTPath)
              if img then
-                 LoadedLUTImage = img
-                 LoadedLUTSize = size
+                 self.LoadedLUTImage = img
+                 self.LoadedLUTSize = size
+
+                 local attr = lfs and lfs.attributes(self.LUTPath)
+                 if attr then self.LastLUTModifiedTime = attr.modification end
+
                  print("LUT successfully loaded to GPU.")
              else
                  print("Error: Failed to parse generated LUT.")
@@ -329,32 +362,53 @@ function Process(req)
         end
     end
 
+    -- State persistence check: If self.LoadedLUTImage is nil (e.g. new frame / script reload) but LUT exists, load it
+    if self.LoadedLUTImage == nil and FileExists(self.LUTPath) then
+        local img, size = ParseCubeTo2D(self.LUTPath)
+        if img then
+            self.LoadedLUTImage = img
+            self.LoadedLUTSize = size
+        end
+    end
+
     if not req:IsPreCalc() then
-        local node = DVIPComputeNode(req, "ColorMatchAIKernel", OpenCLCode, "GlobalParams", ColorMatchAIParams)
+        local has_lut_val = 0
+        local lut_size_val = 0
 
-        local params = node:GetParamBlock(ColorMatchAIParams)
-        params.strength = strength
-        params.preserve_skin = skin
-        params.show_scopes = show_scopes
-
-        if LoadedLUTImage ~= nil then
-            params.has_lut = 1
-            params.lut_size = LoadedLUTSize
-        else
-            params.has_lut = 0
-            params.lut_size = 0
+        if self.LoadedLUTImage ~= nil then
+            has_lut_val = 1
+            lut_size_val = self.LoadedLUTSize
         end
 
-        node:SetParamBlock(params)
+        local node = DVIPComputeNode(req, "ColorMatchAIKernel", OpenCLCode, "", "")
+
         node:AddInput("target_img", target)
 
-        if LoadedLUTImage ~= nil then
-            node:AddInput("lut_img", LoadedLUTImage)
+        if self.LoadedLUTImage ~= nil then
+            node:AddInput("lut_img", self.LoadedLUTImage)
         else
             -- Bind a dummy 1x1 image to prevent OpenCL crash
             local dummy_lut = Image({IMG_Width = 1, IMG_Height = 1, IMG_Depth = 4})
             node:AddInput("lut_img", dummy_lut)
         end
+
+        -- Pack parameters into a 2x1 Image Buffer
+        local params_img = Image({IMG_Width = 2, IMG_Height = 1, IMG_Depth = 4})
+        local p = Pixel()
+
+        p.R = strength
+        p.G = skin
+        p.B = show_scopes
+        p.A = has_lut_val
+        params_img:SetPixel(0, 0, p)
+
+        p.R = lut_size_val
+        p.G = 0.0
+        p.B = 0.0
+        p.A = 0.0
+        params_img:SetPixel(1, 0, p)
+
+        node:AddInput("params_img", params_img)
 
         node:AddOutput("out_img", out)
 
@@ -365,5 +419,5 @@ function Process(req)
         end
     end
 
-    OutImage:Set(req, out)
+    self.OutImage:Set(req, out)
 end
