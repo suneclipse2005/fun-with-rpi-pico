@@ -1,0 +1,369 @@
+--[[--
+ColorMatchAI Fusion Plugin
+Advanced AI-assisted color matching and transfer.
+--]]--
+
+FuRegisterClass("ColorMatchAI", CT_Tool, {
+    REGS_Name = "ColorMatchAI",
+    REGS_Category = "Color",
+    REGS_OpIconString = "CMAI",
+    REGS_OpDescription = "AI-assisted color matching and transfer.",
+    REG_NoBlendCtrls = true,
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+})
+
+ColorMatchAIParams = [[
+    float strength;
+    float preserve_skin;
+    int show_scopes;
+    int has_lut;
+    int lut_size;
+]]
+
+OpenCLCode = [[
+// Helper to sample 3D LUT flattened into a 2D image (size: lut_size*lut_size width, lut_size height)
+float4 sample_3d_lut_2d(__read_only image2d_t lut_img, int lut_size, float3 color) {
+    // clamp color to [0, 1]
+    color = clamp(color, 0.0f, 1.0f);
+
+    // Scale to LUT index space [0, lut_size - 1]
+    float r = color.x * (lut_size - 1);
+    float g = color.y * (lut_size - 1);
+    float b = color.z * (lut_size - 1);
+
+    // Trilinear interpolation weights and indices
+    int r0 = (int)floor(r); int r1 = min(r0 + 1, lut_size - 1); float fr = r - r0;
+    int g0 = (int)floor(g); int g1 = min(g0 + 1, lut_size - 1); float fg = g - g0;
+    int b0 = (int)floor(b); int b1 = min(b0 + 1, lut_size - 1); float fb = b - b0;
+
+    // Helper to read a single pixel from the flattened 2D LUT
+    // Format: The 2D image has height = lut_size, width = lut_size * lut_size
+    // B goes along the Y axis, G goes along X within a block, R selects the block
+    // Wait, the structure created in Lua is:
+    // width = lut_size (r_idx), height = lut_size (g_idx)
+    // we tile it horizontally for each b_idx, so width = lut_size * lut_size, height = lut_size.
+    // X = b_idx * lut_size + r_idx
+    // Y = g_idx
+
+    #define READ_LUT(rr, gg, bb) read_imagef(lut_img, (int2)((bb) * lut_size + (rr), (gg)))
+
+    float4 c000 = READ_LUT(r0, g0, b0);
+    float4 c100 = READ_LUT(r1, g0, b0);
+    float4 c010 = READ_LUT(r0, g1, b0);
+    float4 c110 = READ_LUT(r1, g1, b0);
+    float4 c001 = READ_LUT(r0, g0, b1);
+    float4 c101 = READ_LUT(r1, g0, b1);
+    float4 c011 = READ_LUT(r0, g1, b1);
+    float4 c111 = READ_LUT(r1, g1, b1);
+
+    // Interpolate along R
+    float4 c00 = mix(c000, c100, fr);
+    float4 c10 = mix(c010, c110, fr);
+    float4 c01 = mix(c001, c101, fr);
+    float4 c11 = mix(c011, c111, fr);
+
+    // Interpolate along G
+    float4 c0 = mix(c00, c10, fg);
+    float4 c1 = mix(c01, c11, fg);
+
+    // Interpolate along B
+    return mix(c0, c1, fb);
+}
+
+__kernel void ColorMatchAIKernel(
+    __read_only image2d_t target_img,
+    __write_only image2d_t out_img,
+    __read_only image2d_t lut_img,
+    constant struct GlobalParams *params)
+{
+    int2 pos = (int2)(get_global_id(0), get_global_id(1));
+    int width = get_image_width(target_img);
+    int height = get_image_height(target_img);
+
+    if (pos.x >= width || pos.y >= height)
+        return;
+
+    float4 in_color = read_imagef(target_img, pos);
+    float4 out_color = in_color;
+
+    if (params->has_lut > 0 && params->strength > 0.0f) {
+        float4 mapped_color = sample_3d_lut_2d(lut_img, params->lut_size, in_color.xyz);
+        mapped_color.w = in_color.w;
+        out_color = mix(in_color, mapped_color, params->strength);
+    }
+
+    // Simple skin tone preservation mask (Hue targeting)
+    if (params->preserve_skin > 0.0f) {
+        float r = in_color.x;
+        float g = in_color.y;
+        float b = in_color.z;
+
+        float max_val = max(r, max(g, b));
+        float min_val = min(r, min(g, b));
+
+        bool is_skin = (r > 0.35f && g > 0.15f && b > 0.1f && r > g && r > b && (max_val - min_val) > 0.05f);
+        if (is_skin) {
+            out_color = mix(out_color, in_color, params->preserve_skin);
+        }
+    }
+
+    // Draw Scopes Overlay
+    if (params->show_scopes > 0) {
+        if (pos.x < 256 && pos.y < 256) {
+            out_color = mix(out_color, (float4)(0.1f, 0.1f, 0.1f, 1.0f), 0.8f);
+            if (pos.x == 128 || pos.y == 128) out_color = (float4)(0.5f, 0.5f, 0.5f, 1.0f);
+            if (pos.x < 2 || pos.x > 254 || pos.y < 2 || pos.y > 254) out_color = (float4)(0.8f, 0.8f, 0.8f, 1.0f);
+        }
+    }
+
+    write_imagef(out_img, pos, out_color);
+}
+]]
+
+function Create()
+    InTarget = self:AddInput("Target Image", "TargetImage", { LINKID_DataType = "Image", LINK_Main = 1 })
+    InReference = self:AddInput("Reference Image", "ReferenceImage", { LINKID_DataType = "Image", LINK_Main = 2 })
+
+    InMode = self:AddInput("Match Mode", "MatchMode", {
+        LINKID_DataType = "Number", INPID_InputControl = "ComboControl", INP_Default = 0.0, INP_Integer = true,
+        CC_String_0 = "Fast Match", CC_String_1 = "AI Precision",
+    })
+    InStrength = self:AddInput("Match Strength", "MatchStrength", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 1.0, INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0 })
+    InPreserveSkin = self:AddInput("Preserve Skin", "PreserveSkin", { LINKID_DataType = "Number", INPID_InputControl = "SliderControl", INP_Default = 0.0, INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0 })
+    InShowScopes = self:AddInput("Show Scopes Overlay", "ShowScopes", { LINKID_DataType = "Number", INPID_InputControl = "CheckboxControl", INP_Default = 0.0, INP_Integer = true })
+
+    InAnalyze = self:AddInput("Analyze Frame", "Analyze", { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl", INP_Integer = false, BTNCS_Execute = "btn_analyze_clicked" })
+    InExport = self:AddInput("Export LUT (.cube)", "Export", { LINKID_DataType = "Number", INPID_InputControl = "ButtonControl", INP_Integer = false, BTNCS_Execute = "btn_export_clicked" })
+
+    OutImage = self:AddOutput("Output", "Output", { LINKID_DataType = "Image", LINK_Main = 1 })
+
+    DoAnalyzeNextFrame = false
+    DoExportNextFrame = false
+    LoadedLUTImage = nil
+    LoadedLUTSize = 0
+end
+
+function FileExists(name)
+    local f = io.open(name, "r")
+    if f ~= nil then io.close(f) return true else return false end
+end
+
+function NotifyChanged(inp, param, time)
+    if inp == InAnalyze then
+        print("Analyze requested. Next frame processed will update the color match.")
+        DoAnalyzeNextFrame = true
+    elseif inp == InExport then
+        print("Export requested.")
+        DoExportNextFrame = true
+    end
+end
+
+-- Fast write of image to PPM format for Python to read
+function SaveImageToPPM(img, filename)
+    local width = img.DataWindow:Width()
+    local height = img.DataWindow:Height()
+
+    -- Downsample for speed if needed (e.g., max 512x512)
+    local step = math.max(1, math.floor(math.max(width, height) / 512))
+    local out_w = math.floor(width / step)
+    local out_h = math.floor(height / step)
+
+    local f = io.open(filename, "wb")
+    if not f then return false end
+
+    f:write("P6\n" .. out_w .. " " .. out_h .. "\n255\n")
+
+    local p = Pixel()
+    -- Lua strings are 8-bit clean, but concat in a loop is slow.
+    -- We write row by row.
+    for y = 0, height - 1, step do
+        local row = {}
+        for x = 0, width - 1, step do
+            img:GetPixel(x, height - 1 - y, p) -- Resolve Y is bottom-up, PPM is top-down
+            local r = math.max(0, math.min(255, math.floor(p.R * 255)))
+            local g = math.max(0, math.min(255, math.floor(p.G * 255)))
+            local b = math.max(0, math.min(255, math.floor(p.B * 255)))
+            table.insert(row, string.char(r, g, b))
+        end
+        f:write(table.concat(row))
+    end
+    f:close()
+    return true
+end
+
+-- Parse .cube file and load it into a 2D image buffer for OpenCL
+function ParseCubeTo2D(filename)
+    if not FileExists(filename) then return nil, 0 end
+
+    local size = 0
+    local r_arr = {}
+    local g_arr = {}
+    local b_arr = {}
+
+    local f = io.open(filename, "r")
+    for line in f:lines() do
+        if string.find(line, "LUT_3D_SIZE") then
+            size = tonumber(string.match(line, "%d+"))
+        elseif not string.find(line, "[A-Z]") and line ~= "" then
+            local r, g, b = string.match(line, "([%d%.%-]+)%s+([%d%.%-]+)%s+([%d%.%-]+)")
+            if r and g and b then
+                table.insert(r_arr, tonumber(r))
+                table.insert(g_arr, tonumber(g))
+                table.insert(b_arr, tonumber(b))
+            end
+        end
+    end
+    f:close()
+
+    if size == 0 or #r_arr == 0 then return nil, 0 end
+
+    -- Create 2D Image buffer (width = size * size, height = size)
+    local img = Image({IMG_Width = size * size, IMG_Height = size, IMG_Depth = 4}) -- Float32 depth not available via simple constructor usually, but we set values directly
+    local p = Pixel()
+    p.A = 1.0
+
+    local idx = 1
+    for b_idx = 0, size - 1 do
+        for g_idx = 0, size - 1 do
+            for r_idx = 0, size - 1 do
+                p.R = r_arr[idx]
+                p.G = g_arr[idx]
+                p.B = b_arr[idx]
+
+                local x = b_idx * size + r_idx
+                local y = g_idx
+
+                -- Ensure valid coordinates before setting
+                if x >= 0 and x < size*size and y >= 0 and y < size then
+                    img:SetPixel(x, y, p)
+                end
+                idx = idx + 1
+            end
+        end
+    end
+
+    return img, size
+end
+
+function Process(req)
+    local target = InTarget:GetValue(req)
+    local ref = InReference:GetValue(req)
+    local strength = InStrength:GetValue(req).Value
+    local skin = InPreserveSkin:GetValue(req).Value
+    local show_scopes = InShowScopes:GetValue(req).Value
+    local match_mode = InMode:GetValue(req).Value
+
+    if target == nil then return end
+
+    local out = Image({IMG_Like = target})
+
+    local is_windows = (package.config:sub(1,1) == "\\")
+    local temp_dir = os.getenv("TEMP")
+    if not temp_dir then temp_dir = "/tmp" end
+
+    local tgt_path = temp_dir .. "/ColorMatchAI_tgt.ppm"
+    local ref_path = temp_dir .. "/ColorMatchAI_ref.ppm"
+    local lut_path = temp_dir .. "/ColorMatchAI_out.cube"
+    local json_path = temp_dir .. "/ColorMatchAI_out.json"
+
+    if DoExportNextFrame then
+        DoExportNextFrame = false
+        if not FileExists(lut_path) then
+            print("Error: No LUT has been generated yet. Please click Analyze first.")
+        else
+            local out_path = ""
+            if is_windows then
+                out_path = os.getenv("USERPROFILE") .. "\\Downloads\\ColorMatchAI_Export.cube"
+                os.execute('copy "' .. lut_path:gsub("/", "\\") .. '" "' .. out_path .. '"')
+            else
+                out_path = os.getenv("HOME") .. "/Downloads/ColorMatchAI_Export.cube"
+                os.execute('cp "' .. lut_path .. '" "' .. out_path .. '"')
+            end
+            print("LUT exported successfully to: " .. out_path)
+        end
+    end
+
+    if DoAnalyzeNextFrame and ref ~= nil then
+        DoAnalyzeNextFrame = false
+        print("Saving downsampled frames to disk for Python engine...")
+
+        SaveImageToPPM(target, tgt_path)
+        SaveImageToPPM(ref, ref_path)
+
+        local mode_str = "Fast"
+        if match_mode == 1.0 then mode_str = "AI_Precision" end
+
+        local script_dir = ""
+        local engine_path = ""
+        if is_windows then
+            script_dir = os.getenv("PROGRAMDATA") .. "\\Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility\\ColorMatchAI\\"
+            engine_path = script_dir .. "ColorMatchAI_Engine.py"
+        else
+            script_dir = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/ColorMatchAI/"
+            engine_path = script_dir .. "ColorMatchAI_Engine.py"
+        end
+
+        if not FileExists(engine_path) then
+             engine_path = "./Scripts/ColorMatchAI_Engine.py"
+        end
+
+        print("Invoking Python Engine: " .. engine_path)
+        -- We must use standard Python command. If CV2 fails on PPM we might need to adjust, but OpenCV reads PPM.
+        local cmd = string.format('python "%s" --ref "%s" --tgt "%s" --out_lut "%s" --out_json "%s" --mode "%s"',
+            engine_path, ref_path, tgt_path, lut_path, json_path, mode_str)
+
+        local result = os.execute(cmd)
+        if result == 0 or result == true then
+             print("Analysis successful. Loading LUT into 2D memory map...")
+             local img, size = ParseCubeTo2D(lut_path)
+             if img then
+                 LoadedLUTImage = img
+                 LoadedLUTSize = size
+                 print("LUT successfully loaded to GPU.")
+             else
+                 print("Error: Failed to parse generated LUT.")
+             end
+        else
+             print("Error: Python Engine failed. Ensure python, numpy, and opencv-python are installed.")
+        end
+    end
+
+    if not req:IsPreCalc() then
+        local node = DVIPComputeNode(req, "ColorMatchAIKernel", OpenCLCode, "GlobalParams", ColorMatchAIParams)
+
+        local params = node:GetParamBlock(ColorMatchAIParams)
+        params.strength = strength
+        params.preserve_skin = skin
+        params.show_scopes = show_scopes
+
+        if LoadedLUTImage ~= nil then
+            params.has_lut = 1
+            params.lut_size = LoadedLUTSize
+        else
+            params.has_lut = 0
+            params.lut_size = 0
+        end
+
+        node:SetParamBlock(params)
+        node:AddInput("target_img", target)
+
+        if LoadedLUTImage ~= nil then
+            node:AddInput("lut_img", LoadedLUTImage)
+        else
+            -- Bind a dummy 1x1 image to prevent OpenCL crash
+            local dummy_lut = Image({IMG_Width = 1, IMG_Height = 1, IMG_Depth = 4})
+            node:AddInput("lut_img", dummy_lut)
+        end
+
+        node:AddOutput("out_img", out)
+
+        local ok = node:RunSession(req)
+        if not ok then
+            out = nil
+            print("ColorMatchAI OpenCL Kernel failed")
+        end
+    end
+
+    OutImage:Set(req, out)
+end
