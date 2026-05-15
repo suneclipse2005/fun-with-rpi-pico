@@ -3,6 +3,10 @@ import urandom
 
 import picokeypad as keypad
 
+NUM_PADS = 16
+EXIT_KEY_INDEX = 15
+EXIT_KEY_MASK = 1 << EXIT_KEY_INDEX
+
 keypad.init()
 keypad.set_brightness(1.0)
 game_in_progress = 0
@@ -50,7 +54,7 @@ levels[3] = {
 def draw_pattern(pattern):
     keypad.clear()
 
-    for i in range(16):
+    for i in range(NUM_PADS):
         if i in pattern:
             button = pattern[i]
             keypad.illuminate(i, button[0], button[1], button[2])
@@ -63,17 +67,17 @@ def won():
     while True:
         # flash key 15
         if on:
-            keypad.illuminate(15, 0x00, 0x80, 0x00)
+            keypad.illuminate(EXIT_KEY_INDEX, 0x00, 0x80, 0x00)
             on = 0
         else:
-            keypad.illuminate(15, 0x00, 0x00, 0x00)
+            keypad.illuminate(EXIT_KEY_INDEX, 0x00, 0x00, 0x00)
             on = 1
 
         keypad.update()
         time.sleep(1)
 
         # return when key 15 is pressed
-        if keypad.get_button_states() == 32768:
+        if keypad.get_button_states() == EXIT_KEY_MASK:
             return
     
 
@@ -88,9 +92,9 @@ def init(pattern):
     current_lights = {}
 
     # represents the original pattern, this handles gaps
-    options = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+    options = list(range(NUM_PADS))
 
-    for i in range(16):
+    for i in range(NUM_PADS):
         # pick an option
         pick = urandom.choice(options)
 
@@ -118,7 +122,7 @@ while True:
     button_states = keypad.get_button_states()
 
     # figure out what's pressed
-    for i in range(16):
+    for i in range(NUM_PADS):
         if (button_states >> i) & 0x01 != 0:
             pressed.append(i)
 
